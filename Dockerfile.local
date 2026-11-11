@@ -1,0 +1,61 @@
+# Production build of this branch for a self-hosted deployment.
+# Same stages as Dockerfile.dev, but without the "dev" build tag (which relaxes the CSP and Duo TLS verification)
+# and with a non-instrumented frontend build.
+#
+# Built by ~/homelab/authelia/build-patched.sh, which passes these from the release's own Dockerfile.dev and go.mod.
+
+ARG NODE_IMAGE=node:26-alpine@sha256:ef24c5053d50fdc3e4e56eb4e7ddb7861874ab0fdc797046ba897581deb8e868
+ARG GO_IMAGE=golang:1.27.4-bookworm
+ARG BASE_IMAGE=authelia/base:latest@sha256:21fb137f9cc805698b7f249b01ecf8f95b43c68d7418d20f202b157f4414822f
+
+FROM ${NODE_IMAGE} AS builder-frontend
+
+WORKDIR /node/src/app
+
+ENV SHELL="/bin/sh" PNPM_HOME="/usr/local"
+
+COPY --link web ./
+
+RUN --mount=type=cache,id=pnpm-store,target=/pnpm/store \
+	wget -qO /tmp/pnpm-install.sh https://raw.githubusercontent.com/pnpm/get.pnpm.io/916ce9e8412d2ce06bb7106a53ce24690b9001dd/install.sh && \
+	ENV="/root/.profile" sh /tmp/pnpm-install.sh && \
+	pnpm install --frozen-lockfile --ignore-scripts --store-dir /pnpm/store && \
+	pnpm build
+
+FROM ${GO_IMAGE} AS builder-backend
+
+WORKDIR /go/src/app
+
+COPY --link go.mod go.sum ./
+
+RUN go mod download
+
+COPY --link / ./
+
+COPY --link --from=builder-frontend /node/src/internal/server/public_html internal/server/public_html
+
+ARG VERSION=unknown
+ARG BRANCH=unknown
+ARG COMMIT=unknown
+
+RUN \
+	mv api internal/server/public_html/api && \
+	P=github.com/authelia/authelia/v4/internal/utils && \
+	CGO_ENABLED=1 CGO_CPPFLAGS="-D_FORTIFY_SOURCE=2 -fstack-protector-strong" CGO_LDFLAGS="-Wl,-z,relro,-z,now" go build \
+	-ldflags "-linkmode=external -s -w -X ${P}.BuildTag=${VERSION} -X '${P}.BuildState=untagged clean' -X ${P}.BuildExtra=remote-ip-check -X ${P}.BuildBranch=${BRANCH} -X ${P}.BuildCommit=${COMMIT}" \
+	-trimpath -buildmode=pie -o authelia ./cmd/authelia
+
+FROM ${BASE_IMAGE}
+
+WORKDIR /app
+
+ENV PATH="/app:${PATH}" PUID=0 PGID=0 X_AUTHELIA_CONFIG="/config/configuration.yml"
+
+COPY --link --from=builder-backend /go/src/app/authelia /go/src/app/LICENSE /go/src/app/entrypoint.sh /go/src/app/healthcheck.sh ./
+
+COPY --link --from=builder-backend --chmod=666 /go/src/app/.healthcheck.env ./
+
+EXPOSE 9091
+
+ENTRYPOINT ["/app/entrypoint.sh"]
+HEALTHCHECK --interval=30s --timeout=3s --start-period=1m CMD /app/healthcheck.sh
